@@ -1,0 +1,130 @@
+# Canopy overrides for the stock CVAT stack (local test). Use through up.ps1 / down.ps1, which pass
+#   -p canopy-cvat -f ../docker-compose.yml -f ../components/serverless/docker-compose.serverless.yml -f compose.canopy.yml
+# Relative paths below resolve from the CVAT repo root (the folder of the first compose file).
+# Everything this project creates (containers, named volumes, network canopy-cvat_cvat) goes away with down.ps1 -Purge.
+
+x-share: &share
+  - type: bind
+    source: D:/canopy-evidence/training        # frames, read-only: tasks are created from the share, nothing is copied
+    target: /home/django/share
+    read_only: true
+
+services:
+  cvat_server:
+    volumes: *share
+  cvat_worker_import:
+    volumes: *share
+  cvat_worker_export:
+    volumes: *share
+  cvat_worker_annotation:
+    volumes: *share
+  cvat_worker_chunks:
+    volumes: *share
+  cvat_worker_utils:
+    volumes: *share
+
+  # Windows reserves TCP 7981-8680 (Hyper-V/WinNAT exclusions), so host ports move to 90xx, loopback only.
+  traefik:
+    ports: !override
+      - 127.0.0.1:9080:8080
+  nuclio:
+    ports:
+      - 127.0.0.1:9070:8070
+
+  # GPU model server shared by all canopy functions (SAM 3 + plate detector), see models/server.py.
+  canopy_models:
+    build: ./canopy/models
+    image: canopy-cvat/models:latest
+    container_name: canopy_models
+    restart: unless-stopped
+    networks: [cvat]
+    ports:
+      - 127.0.0.1:9090:8090
+    gpus: all
+    environment:
+      TORCHDYNAMO_DISABLE: "1"     # eager, like the Windows run that made auto_v1 (and no C compiler needed)
+      # SAM 3 next to Qwen without swapping: 2 prompts per pass (reproduces the auto_v1 proposals 97/97) and
+      # expandable segments cut the proposal peak from 13.3 GB (8 prompts) to 4.0 GB (measured 2026-10-07)
+      PROPOSE_TEXT_CHUNK: "2"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    volumes:
+      - D:/canopy-evidence/tools:/canopy/tools:ro
+      - D:/canopy-evidence/models/plate_det_v1:/models/plate_det_v1:ro
+      - type: bind
+        source: C:/Users/Canopy Intelligence/.cache/huggingface/hub/models--facebook--sam3/blobs/9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e
+        target: /models/sam3/sam3.pt
+        read_only: true
+
+  # VLMs, same args as tools/autolabel/vllm_serve.sh. `vllm` = Qwen (classes, plate code/origin/category),
+  # `vllm_ocr` = GLM-OCR (plate digits, text transcription; ~3 GB, can stay up next to canopy_models).
+  # Qwen3.8 NVFP4 is 21 GB of weights: it only fits once canopy_models has unloaded SAM 3 (see up.ps1 -Mode).
+  vllm:
+    image: &vllm_image ${VLLM_IMAGE:-vllm/vllm-openai:v0.30.0}     # same vLLM as the WSL venv
+    container_name: canopy_vllm
+    profiles: [vlm]
+    restart: "no"
+    networks: [cvat]
+    ports:
+      - 127.0.0.1:9011:8010                  
+    ipc: host
+    gpus: all
+    volumes: &hf
+      - D:/hf-cache:/root/.cache/huggingface
+    environment: &vllm_env
+      HF_HUB_OFFLINE: "1"
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
+    command: >
+      --model ${VLM_MODEL:-nvidia/Qwen3.8-27B-NVFP4}
+      --served-model-name qwen qwen38
+      --host 0.0.0.0 --port 8010
+      --max-model-len 8192
+      --gpu-memory-utilization ${VLM_GPU_UTIL:-0.72}
+      --attention-backend FLASH_ATTN
+      --enable-prefix-caching
+      --max-num-seqs ${VLM_MAX_SEQS:-16}
+      --limit-mm-per-prompt '{"image": 2, "video": 0}'
+      --mm-processor-kwargs '{"max_pixels": 802816}'
+
+  vllm_ocr:
+    image: *vllm_image
+    container_name: canopy_vllm_ocr
+    profiles: [ocr]
+    restart: "no"
+    networks: [cvat]
+    ports:
+      - 127.0.0.1:9012:8010
+    ipc: host
+    gpus: all
+    volumes: *hf
+    environment: *vllm_env
+    command: >
+      --model zai-org/GLM-OCR --trust-remote-code
+      --served-model-name glm
+      --host 0.0.0.0 --port 8010
+      --max-model-len 8192
+      --gpu-memory-utilization ${OCR_GPU_UTIL:-0.15}
+      --attention-backend FLASH_ATTN
+      --enable-prefix-caching
+      --max-num-seqs 32
+      --limit-mm-per-prompt '{"image": 2, "video": 0}'
+
+  # Disposable tool box: nuctl for deploying functions and the cvat-sdk labeler. Run with `docker compose run`.
+  tools:
+    build: ./canopy/labeler
+    image: canopy-cvat/tools:latest
+    profiles: [tools]
+    networks: [cvat]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - D:/canopy-cvat/cvat/canopy:/work
+      - D:/canopy-evidence/tools:/canopy/tools:ro
+      - D:/canopy-evidence/curated:/canopy/curated:ro  # read-only: pull writes exports/*.jsonl, apply_pull.py runs on Windows
+      - D:/canopy-evidence/training:/canopy/training:ro
+    working_dir: /work
+    env_file:
+      - path: ./canopy/.env                            # CVAT_USER / CVAT_PASSWORD for the labeler
+        required: false
+    environment:
+      CVAT_URL: http://cvat-server:8080      # the alias: Django rejects hostnames with "_"
+      NUCLIO_DASHBOARD_URL: http://nuclio:8070
+      CANOPY_ROOT: /canopy

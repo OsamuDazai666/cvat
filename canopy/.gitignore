@@ -1,0 +1,6 @@
+# local-only: admin credentials, run logs, exports (labels), caches
+.env
+logs/
+exports/
+__pycache__/
+tests/gold_glm_reads.json
