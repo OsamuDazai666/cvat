@@ -75,6 +75,28 @@ def semantic():
     return M["semantic"]
 
 
+ON = {}                         # SAM 3 predictor name -> "cuda" | "cpu" (where its weights are right now)
+
+
+def only_on_gpu(name):
+    """Keep ONE SAM 3 model on the GPU and park the other in system RAM. With Qwen (72%) and both SAM 3 models
+    resident the card sits at 31.6 of 32.6 GB, Windows starts paging GPU memory and Qwen slows to a crawl (vehicle
+    clicks ran past CVAT's 60 s timeout). Moving ~2 GB of fp16 weights takes well under a second."""
+    for other in ("semantic", "visual"):
+        p = M.get(other)
+        if p is None or getattr(p, "model", None) is None:          # not loaded / not built yet (lazy first call)
+            continue
+        dev = "cuda" if other == name else "cpu"
+        if ON.get(other, "cuda") != dev:
+            if dev == "cpu" and hasattr(p, "features"):
+                p.features = None                                   # cached image embedding lives on the GPU
+            p.model.to(dev)
+            ON[other] = dev
+            if dev == "cpu":
+                LAST.pop(other, None)
+    release()
+
+
 def visual():
     if "visual" not in M:
         from ultralytics.models.sam import SAM3Predictor
@@ -101,6 +123,7 @@ def set_image(name, pred, img, key):
 # ---- endpoints -----------------------------------------------------------------------------------------------------
 def sam3_visual(req, img, key):
     pred = visual()
+    only_on_gpu("visual")
     set_image("visual", pred, img, key)
     kw = {}
     pts, labels = req.get("points") or [], req.get("labels") or []
@@ -124,6 +147,7 @@ def sam3_visual(req, img, key):
 
 def sam3_text(req, img, key):
     pred = semantic()
+    only_on_gpu("semantic")
     set_image("semantic", pred, img, key)
     prompts = [p for p in req.get("prompts") or [] if p.strip()]
     conf, want_masks = float(req.get("conf", 0.35)), bool(req.get("masks"))
@@ -149,6 +173,7 @@ def propose_ep(req, img, key):
     import propose
     from prompts import SAM_PROMPTS
     pred = semantic()
+    only_on_gpu("semantic")
     LAST.pop("semantic", None)                     # propose_frame calls set_image itself (full frame + tiles)
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         f.write(cv2.imencode(".png", img)[1].tobytes())
@@ -209,6 +234,7 @@ def unload(req, img, key):
     import gc
     M.clear()
     LAST.clear()
+    ON.clear()
     gc.collect()
     try:
         import torch
@@ -219,7 +245,12 @@ def unload(req, img, key):
     return {"ok": True}
 
 
-ROUTES = {"/sam3/visual": sam3_visual, "/sam3/text": sam3_text, "/propose": propose_ep,
+def warm_up_ep(req, img, key):
+    threading.Thread(target=warm_up, kwargs={"wait_for_qwen": bool(req.get("wait_for_qwen"))}, daemon=True).start()
+    return {"ok": True, "started": True}
+
+
+ROUTES = {"/warm_up": warm_up_ep, "/sam3/visual": sam3_visual, "/sam3/text": sam3_text, "/propose": propose_ep,
           "/plate/detect": plate_detect, "/unload": unload}
 
 
@@ -271,7 +302,40 @@ class H(BaseHTTPRequestHandler):
         pass
 
 
+def qwen_serving():
+    import urllib.request
+    try:
+        with urllib.request.urlopen(os.environ.get("VLM_URL", "http://vllm:8010/v1") + "/models", timeout=3):
+            return True
+    except Exception:
+        return False
+
+
+def warm_up(wait_for_qwen=True):
+    """Load both SAM 3 models and run one pass each. Cold, the first vehicles click spends ~30 s loading SAM 3
+    before Qwen even starts, which runs past CVAT's 60 s gateway timeout (504). Qwen must come up FIRST: vLLM
+    refuses to start when it can't get its 72% of the GPU, so at startup this waits (up to 10 min) for Qwen."""
+    if wait_for_qwen:
+        for _ in range(120):
+            if qwen_serving():
+                break
+            time.sleep(5)
+    t0 = time.time()
+    img = np.full((720, 1280, 3), 127, np.uint8)
+    try:
+        with GPU:
+            propose_ep({"tiles": True}, img, "warm-up")
+            sam3_visual({"points": [[640, 360]], "labels": [1]}, img, "warm-up")
+            LAST.clear()
+            release()
+        log(f"warm-up done in {time.time() - t0:.0f}s: {sorted(M)} loaded")
+    except Exception as e:
+        log(f"warm-up failed ({e!r}); models load on first use instead")
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8090))
+    if os.environ.get("WARM_UP", "1") == "1":
+        threading.Thread(target=warm_up, daemon=True).start()      # requests queue on the GPU lock meanwhile
     log(f"canopy-models on :{port}")
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()

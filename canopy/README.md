@@ -36,20 +36,20 @@ tests/                parity and smoke tests from the local test
 
 ## GPU (RTX 5090, 32 GB)
 
-Everything runs at once, with no swapping (measured 2026-10-07: 29.5 of 32.6 GB):
+Everything stays loaded (measured 2026-10-07: 29.7 of 32.6 GB):
 - **Qwen3.8:** 72% of the GPU
-- **SAM 3:** the click model plus the proposal model
+- **SAM 3 click model and proposal model:** only the one in use sits on the GPU. The other is parked in system RAM and moved back in under a second (`only_on_gpu` in `models/server.py`). With both on the GPU, the card hits 31.6 GB, Windows pages GPU memory, and Qwen slows until vehicle clicks time out.
 - **Plate detector:** on the CPU
 
-SAM 3's proposal pass scores 2 text prompts per forward pass instead of 8, with
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. That cuts its peak from 13.3 GB to 4.0 GB and still reproduces
-the `auto_v1` proposals 97/97.
+SAM 3's proposal pass scores 2 text prompts per forward pass instead of 8, with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. That cuts its peak from 13.3 GB to 4.0 GB and still reproduces the `auto_v1` proposals 97/97.
 
-| Button | Time per frame |
+Both SAM 3 models load at startup, once Qwen is serving (about 50 s), so the first click after a restart doesn't hit CVAT's 60 s timeout. vLLM only starts when its 72% of the GPU is free, so `up.ps1` and the labeler unload SAM 3 before starting Qwen and warm it up again afterwards.
+
+| Button | Time per frame (through CVAT) |
 |---|---|
-| Canopy vehicles (warm) | 6–9 s |
-| Canopy vehicles (first click after a restart, SAM 3 loads) | about 35 s |
-| Canopy plates | about 1.5 s per plate |
+| Canopy vehicles | 10–12 s, including the first click after a restart |
+| Canopy plates | about 2.7 s for a frame with two plates |
+| SAM 3 click | 1.3 s after a vehicles click (model swap), then 0.3 s |
 
 Measured on task 4, the vehicles button matched 93% of `auto_v1` boxes, and 91% of those have the same class.
 

@@ -15,10 +15,22 @@ if ($Build) {
 # create every service (VLM containers too, stopped) so the labeler can start/stop them by name
 Compose --profile vlm --profile ocr up --no-start
 Compose up -d
-function Unload { try { Invoke-RestMethod -Method Post -Uri http://127.0.0.1:9090/unload -Body "{}" -ContentType application/json | Out-Null } catch {} }
+function Models($path, $body = "{}") {
+    for ($i = 0; $i -lt 30; $i++) {          # canopy_models may still be starting
+        try { Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:9090$path" -Body $body -ContentType application/json | Out-Null; return } catch { Start-Sleep 2 }
+    }
+}
 switch ($Mode) {
-    # Qwen3.8 at 72% of the GPU + the SAM 3 click model fit together (31 of 32.6 GB, measured)
-    "qwen" { docker stop canopy_vllm_ocr 2>$null | Out-Null; Unload; docker start canopy_vllm | Out-Null }
+    # Qwen3.8 (72% of the GPU) + both SAM 3 models fit together (29.5 of 32.6 GB, measured). vLLM only starts when
+    # its share is free, so SAM 3 is unloaded first and warmed up again once Qwen serves (the server waits for it)
+    "qwen" {
+        docker stop canopy_vllm_ocr 2>$null | Out-Null
+        if (-not (docker ps -q -f "name=^canopy_vllm$")) {
+            Models "/unload"
+            docker start canopy_vllm | Out-Null
+            Models "/warm_up" '{"wait_for_qwen": true}'
+        }
+    }
     "none" { docker stop canopy_vllm canopy_vllm_ocr 2>$null | Out-Null }
 }
 Write-Host "CVAT: http://localhost:9080   Nuclio: http://localhost:9070   models: http://localhost:9090/health"

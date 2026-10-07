@@ -91,8 +91,10 @@ def serve(want):
     for name, cont in (("qwen", "canopy_vllm"), ("glm", "canopy_vllm_ocr")):
         if name not in want:
             docker("stop", cont)
-    if "qwen" in want:
-        http_json(MODELS_URL + "/unload", {})              # SAM 3 out of the way: Qwen3.8 NVFP4 needs ~25 GB
+    qwen_was_up = bool(docker("ps", "-q", "-f", "name=^canopy_vllm$").stdout.strip())
+    if "qwen" in want and not qwen_was_up:
+        # vLLM refuses to start unless its 72% of the GPU is free: SAM 3 out of the way first, back in afterwards
+        http_json(MODELS_URL + "/unload", {})
     for name, cont, url in (("glm", "canopy_vllm_ocr", OCR_URL), ("qwen", "canopy_vllm", VLM_URL)):
         if name not in want:
             continue
@@ -108,6 +110,8 @@ def serve(want):
                 time.sleep(5)
         else:
             sys.exit(f"{cont} did not come up; see `docker logs {cont}`")
+    if "qwen" in want and not qwen_was_up:
+        http_json(MODELS_URL + "/warm_up", {})             # SAM 3 back in, now that Qwen has its memory
     log("serving:", ", ".join(sorted(want)) or "nothing")
 
 
